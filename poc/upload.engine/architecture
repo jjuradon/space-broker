@@ -1,0 +1,18 @@
+FlowX.Upload (core package, net6.0;net8.0;net10.0 — no conditional compilation needed, see note below)
+  Domain/
+    UploadSession, UploadSessionStatus, PlanItem, PlanItemKind,
+    PlanItemResult, RowValidationError
+  Application/
+    IUploadParser<TParsed>, IUploadPreProcessor<TParsed>, PreProcessResult
+    IUploadProcessor
+    IUploadStore
+    IUploadExecutor
+    IUploadPipeline               — non-generic facade, one instance per pipeline key
+    IUploadPipelineRegistry       — resolves IUploadPipeline by key
+    UploadOrchestrator            — the package's core coordination logic (parse→preprocess→confirm→process)
+  Infrastructure/
+    BackgroundServiceUploadExecutor : BackgroundService, IUploadExecutor
+    StaleSessionReconciler : IHostedService
+    EfUploadStore : IUploadStore  (reference implementation)
+  DependencyInjection/
+    AddFlowXUpload(...), AddPipeline<TParsed>(key, ...)
