@@ -1,0 +1,44 @@
+<div class="card shadow-sm">
+  <div class="card-header" [ngClass]="failureReason ? 'bg-danger-subtle' : 'bg-success-subtle'">
+    <ng-container *ngIf="failureReason; else completedHeader">
+      Upload failed
+    </ng-container>
+    <ng-template #completedHeader>
+      Upload {{ isDryRun ? 'simulation ' : '' }}completed
+      <span *ngIf="failedCount > 0" class="text-danger">— {{ failedCount }} item(s) failed</span>
+    </ng-template>
+  </div>
+
+  <div class="card-body" *ngIf="failureReason">
+    <p class="text-danger mb-0">{{ failureReason }}</p>
+  </div>
+
+  <div class="table-responsive" *ngIf="results.length > 0">
+    <table class="table table-sm mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>Plan item</th>
+          <th>Result</th>
+          <th>Detail</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr *ngFor="let result of results">
+          <td class="font-monospace small">{{ result.planItemId }}</td>
+          <td>
+            <span class="badge" [ngClass]="result.succeeded ? 'bg-success' : 'bg-danger'">
+              {{ result.succeeded ? 'Succeeded' : 'Failed' }}
+            </span>
+          </td>
+          <td>{{ result.failureReason || '—' }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card-footer text-end" *ngIf="failureReason">
+    <button type="button" class="btn btn-warning" (click)="retry.emit()">
+      Retry (confirm plan again)
+    </button>
+  </div>
+</div>

@@ -1,0 +1,51 @@
+<div class="container py-4" *ngIf="session$ | async as session">
+  <div *ngIf="session.isDryRun" class="alert alert-info d-flex align-items-center">
+    <span class="badge bg-info-subtle text-info-emphasis border border-info me-2">DRY RUN</span>
+    This upload is a simulation — no changes will be saved.
+  </div>
+
+  <div *ngIf="actionError" class="alert alert-danger">{{ actionError }}</div>
+
+  <ng-container [ngSwitch]="session.status">
+    <app-processing-indicator
+      *ngSwitchCase="UploadSessionStatus.PreProcessing"
+      label="Validating your file…"
+    ></app-processing-indicator>
+
+    <app-processing-indicator
+      *ngSwitchCase="UploadSessionStatus.Confirmed"
+      label="Starting processing…"
+    ></app-processing-indicator>
+
+    <app-processing-indicator
+      *ngSwitchCase="UploadSessionStatus.Processing"
+      label="Applying changes to the branch inventory…"
+    ></app-processing-indicator>
+
+    <app-validation-errors
+      *ngSwitchCase="UploadSessionStatus.ValidationFailed"
+      [errors]="session.validationErrors"
+      (corrected)="onCorrectionsSubmitted($event)"
+    ></app-validation-errors>
+
+    <app-plan-review
+      *ngSwitchCase="UploadSessionStatus.PendingConfirmation"
+      [plan]="session.plan ?? []"
+      (confirmed)="onConfirmed($event)"
+    ></app-plan-review>
+
+    <app-upload-results
+      *ngSwitchCase="UploadSessionStatus.Completed"
+      [results]="session.results"
+      [isDryRun]="session.isDryRun"
+    ></app-upload-results>
+
+    <app-upload-results
+      *ngSwitchCase="UploadSessionStatus.Failed"
+      [results]="session.results"
+      [isDryRun]="session.isDryRun"
+      [failureReason]="session.failureReason"
+      (retry)="onRetry()"
+    ></app-upload-results>
+  </ng-container>
+</div>

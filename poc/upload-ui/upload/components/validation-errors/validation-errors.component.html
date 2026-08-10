@@ -1,0 +1,36 @@
+<div class="card shadow-sm">
+  <div class="card-header bg-danger-subtle">
+    <strong>{{ errors.length }}</strong> row(s) need attention before this file can be processed.
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>Sheet</th>
+          <th>Row</th>
+          <th>Field</th>
+          <th>Problem</th>
+          <th class="value-col">Corrected value</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr *ngFor="let group of form.controls" [formGroup]="group">
+          <td>{{ group.controls.sheetIndex.value + 1 }}</td>
+          <td>{{ group.controls.rowNumber.value }}</td>
+          <td><span class="badge bg-secondary">{{ group.controls.field.value }}</span></td>
+          <td class="text-danger">{{ group.controls.message.value }}</td>
+          <td>
+            <input type="text" class="form-control form-control-sm" formControlName="value" />
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card-footer text-end">
+    <button type="button" class="btn btn-primary" (click)="onSubmit()">
+      Resubmit corrections
+    </button>
+  </div>
+</div>

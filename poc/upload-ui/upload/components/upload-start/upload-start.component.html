@@ -1,0 +1,33 @@
+<div class="container py-4">
+  <h1 class="h3 mb-4">Upload Branch Inventory</h1>
+
+  <form [formGroup]="form" (ngSubmit)="onSubmit()" class="card p-4 shadow-sm upload-start-card">
+    <div class="mb-3">
+      <label for="file" class="form-label">Excel file</label>
+      <input
+        id="file"
+        type="file"
+        class="form-control"
+        accept=".xlsx"
+        (change)="onFileSelected($event)"
+      />
+      <div class="form-text">Multi-sheet .xlsx file with group, provider reference, and pricing details.</div>
+    </div>
+
+    <div class="form-check mb-4">
+      <input id="dryRun" type="checkbox" class="form-check-input" formControlName="dryRun" />
+      <label for="dryRun" class="form-check-label">
+        Dry run <span class="text-muted">(validates and simulates the plan — nothing is saved)</span>
+      </label>
+    </div>
+
+    <div *ngIf="errorMessage" class="alert alert-danger" role="alert">
+      {{ errorMessage }}
+    </div>
+
+    <button type="submit" class="btn btn-primary" [disabled]="form.invalid || isSubmitting">
+      <span *ngIf="isSubmitting" class="spinner-border spinner-border-sm me-2" aria-hidden="true"></span>
+      Upload
+    </button>
+  </form>
+</div>
