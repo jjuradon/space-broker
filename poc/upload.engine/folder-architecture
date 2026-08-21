@@ -1,0 +1,69 @@
+FlowX.Upload/
+  Domain/
+    Aggregates/
+      UploadSession.cs
+
+    Entities/
+      PlanItem.cs                          — has identity (Id); referenced by selection & results
+
+    ValueObjects/
+      RowValidationError.cs
+      RowCorrection.cs
+      PlanItemResult.cs
+
+    Enums/
+      UploadSessionStatus.cs
+      PlanItemKind.cs
+
+    Events/                                — reserved: UploadSession raises no domain events today;
+                                              add here if a use case needs cross-context reactions
+                                              (e.g. notifying another bounded context on Completed)
+
+    Exceptions/                            — reserved: guard clauses currently throw
+                                              InvalidOperationException; promoting these to named
+                                              domain exceptions (e.g. InvalidSessionTransitionException)
+                                              is a reasonable next step but is itself a breaking
+                                              change to anyone catching the current type — flagged,
+                                              not done here without your sign-off
+
+  Application/
+    Abstractions/                           — ports: interfaces this layer depends on, implements nowhere
+      Persistence/
+        IUploadStore.cs
+      Scheduling/
+        IUploadExecutor.cs
+      Pipelines/                            — the four/five contracts a consuming pipeline implements
+        IUploadContextPreparer.cs
+        IUploadParser.cs
+        IUploadPreProcessor.cs
+        IUploadCorrector.cs
+        IUploadProcessor.cs
+
+    Pipelines/                              — concrete application-owned execution machinery (not ports)
+      Defaults/
+        EmptyUploadContext.cs
+        EmptyContextPreparer.cs
+      IUploadPipeline.cs
+      UploadPipeline.cs
+      IUploadPipelineRegistry.cs
+      UploadPipelineRegistry.cs
+
+    Models/
+      PreProcessResult.cs                   — application-layer result/DTO, not a domain concept
+
+    UseCases/                               — Uncle Bob's "Application Business Rules" terminology;
+      UploadOrchestrator.cs                  the one interactor coordinating the whole session lifecycle
+
+  Infrastructure/
+    Scheduling/                             — adapter implementing Application/Abstractions/Scheduling
+      BackgroundServiceUploadExecutor.cs
+      StaleSessionReconciler.cs
+
+  DependencyInjection/                      — composition root; intentionally outside the three-layer
+    UploadServiceCollectionExtensions.cs     split, since wiring necessarily references all of them —
+    UploadBuilder.cs                         this is standard for a library's own DI extension methods
+    PipelineBuilder.cs
+
+FlowX.Upload.EntityFrameworkCore/           — already an isolated Infrastructure/Persistence adapter
+  UploadDbContext.cs                         package at the project level; no change needed
+  EfUploadStore.cs
