@@ -1,144 +1,199 @@
 # Design
 
-This document explains *why* FlowX.Upload is shaped the way it is — the
-decisions, the trade-offs, and what was deliberately rejected. If you're
-about to propose a change that seems obviously better, check here first;
-there's a reasonable chance the alternative was already considered.
+This document explains *why* FlowX.Upload is shaped the way it is. If
+you're about to propose a change that seems obviously better, check here
+first; there's a reasonable chance the alternative was already considered.
 
-## Core shape: three fixed stages
+## The PreProcess → Plan rename
+
+<a name="the-preprocess--plan-rename"></a>
+
+The stage that validates parsed data and proposes a set of changes was
+originally named `PreProcess` (`IUploadPreProcessor<TParsed>`,
+`PreProcessResult`). It is now named **Plan** (`IUploadPlanner<TParsed>`,
+`PlanResult`).
+
+**Why:** `PreProcessor` and `Processor` (the unrelated execution stage,
+`IUploadProcessor`) were one prefix apart in name while doing entirely
+different jobs — one validates and proposes, the other executes. That
+similarity was a standing source of confusion for anyone skimming the
+codebase or the docs. Naming the stage after its actual output — a Plan —
+removes the collision entirely and matches the vocabulary already used
+everywhere else in the domain (`UploadSession.Plan`, `PlanItem`,
+`PlanItemResult`, `SetPlan`). The four stages are now cleanly:
 
 ```
-Parse  →  PreProcess (validate + build plan)  →  [user confirms]  →  Process
+Prepare  →  Parse  →  Plan  →  [user confirms]  →  Process
+```
+
+**What else changed as a consequence, and why it's not arbitrary:**
+
+- `UploadSessionStatus.PreProcessing` → `Planning`. The status names the
+  session's current *goal* (producing a plan), not a stage name that no
+  longer exists.
+- `UploadOrchestrator.RunPreProcessingAsync` → `RunPlanningAsync`;
+  `IUploadExecutor.EnqueuePreProcessingAsync` → `EnqueuePlanningAsync`;
+  `UploadWorkItem.PreProcess` → `UploadWorkItem.Plan` — mechanical
+  consequences of the same rename, kept consistent rather than left
+  half-renamed.
+- `PreProcessResult`'s success factory was `PreProcessResult.Plan(...)`.
+  Under the new name that would read as `PlanResult.Plan(...)`, which is
+  circular and confusing next to the existing `Plan` *property* on the
+  same type. It was renamed to `PlanResult.Success(...)` instead — a
+  small, deliberate improvement made *because* the mechanical rename would
+  have produced something worse, not a scope-creep addition.
+
+**This is a MAJOR (breaking) version change**, per `CONTRIBUTING.md`'s
+versioning policy — every public type/member above changed name.
+
+### Required data migration
+
+`UploadDbContext` maps `UploadSession.Status` via `.HasConversion<string>()`,
+which persists the **enum member name as literal text**. Any row currently
+stored with `Status = "PreProcessing"` will fail to deserialize the moment
+this version is deployed, since the enum member no longer exists under
+that name.
+
+**Before deploying this version against an existing database**, run a
+migration renaming the stored value:
+
+```sql
+UPDATE flowx_upload."UploadSessions" SET "Status" = 'Planning' WHERE "Status" = 'PreProcessing';
+```
+
+(Adjust schema/table/column casing to your actual database and migration
+tooling.) No other status value's stored text changed — `ValidationFailed`,
+`PendingConfirmation`, `Confirmed`, `Processing`, `Completed`, and `Failed`
+are all unchanged. This is a one-time, one-row-condition migration; it does
+not need to be part of an ongoing compatibility shim.
+
+## Core shape: four fixed stages
+
+```
+Prepare  →  Parse  →  Plan  →  [user confirms]  →  Process
 ```
 
 This is fixed, not configurable — the package does not support arbitrary
-pipeline topologies. That's a deliberate scope limit: a generic workflow
-engine that lets you wire steps in any order is a much bigger, much leakier
-abstraction than a three-stage contract every use case in this domain
-actually follows. If a future use case genuinely doesn't fit this shape,
-that's a signal to build something else, not to generalize this package
-until it fits everything.
+pipeline topologies. A generic workflow engine that lets you wire steps in
+any order would be a much bigger, much leakier abstraction than a
+four-stage contract every use case in this domain actually follows. If a
+future use case genuinely doesn't fit this shape, that's a signal to build
+something else, not to generalize this package until it fits everything.
+
+**Why Prepare is separate from Parse:** Prepare resolves durable,
+pipeline-specific context (potentially needing data the parser itself
+depends on) before Parse runs. Both execute in one pass, together, while
+the file stream is available — Prepare's output (`TContext`) is persisted
+immediately so neither Parse nor a later correction cycle ever needs the
+raw file again.
 
 ## Layering
 
-<a name="layering"></a>
-
 ```
-Domain          — UploadSession aggregate. Zero framework dependencies.
-Application     — ports (IUploadParser<T>, IUploadStore, IUploadExecutor, ...),
-                   UploadOrchestrator, pipeline registry/facade.
+Domain          — UploadSession aggregate, entities, value objects, enums.
+                   Zero framework dependencies.
+Application     — Abstractions (ports), Pipelines (facade/registry/defaults),
+                   Models (PlanResult), UseCases (UploadOrchestrator).
 Infrastructure  — BackgroundServiceUploadExecutor, StaleSessionReconciler.
 ```
 
-**The package never contains business logic.** `IUploadParser<T>`,
-`IUploadPreProcessor<T>`, `IUploadProcessor`, and `IUploadCorrector<T>` are
-implemented entirely in the consuming application's own
-application/infrastructure layers. This is the one rule the package cannot
-compromise on without becoming a different kind of product — the moment it
-starts making domain assumptions, it stops being reusable across use cases.
+**The package never contains business logic.** `IUploadContextPreparer<T>`,
+`IUploadParser<TContext,TParsed>`, `IUploadPlanner<TParsed>`,
+`IUploadProcessor`, and `IUploadCorrector<TContext,TParsed>` are implemented
+entirely in the consuming application's own layers.
 
-## Why `UploadSession` is a real aggregate, not a status enum
+### Why `IUploadStore` sits in `Application/Abstractions`, not `Domain`
 
-Early designs considered tracking upload state as a status column plus
-ad-hoc infrastructure code checking/setting it. That was rejected: every
-guard (only the initiator can confirm; can't process before confirming;
-can't fail a completed session) would then live wherever the infrastructure
-code happened to touch it, enforced inconsistently. `UploadSession` makes
-every transition a method that throws on misuse — the state machine cannot
-be driven into an invalid state by any caller, including future
-maintainers who haven't read this document.
+A strict DDD reading might place the session's persistence contract as a
+Domain-layer Repository interface, next to `UploadSession` itself.
+`IUploadStore` doesn't fit that cleanly: its
+`GetByStatusOlderThanAsync(status, olderThan, ct)` member exists solely to
+serve `StaleSessionReconciler` — an Infrastructure-layer technical concern
+(crash recovery), not a domain invariant `UploadSession` itself would ever
+need satisfied. A pure domain repository interface should only expose
+operations meaningful to loading/saving the aggregate. Mixing in an
+operational query for one specific caller is a Clean Architecture
+Application-layer port, not a DDD domain repository — so that's where it
+lives.
+
+### Why `PlanItem` is a Domain Entity, not a Value Object
+
+`PlanItem.Id` isn't incidental — `UploadSession.Confirm` selects items by
+`Id`, and `PlanItemResult.PlanItemId` correlates back to it by identity,
+not by structural equality. An object with lifecycle-independent identity
+that other objects reference is an Entity in DDD terms, even when declared
+as an immutable C# `record`. `RowValidationError`, `RowCorrection`, and
+`PlanItemResult` genuinely have no identity — pure structural facts about a
+row or an outcome — and stay Value Objects.
+
+## Why `UploadSession` is a real aggregate, not a status enum plus ad-hoc checks
+
+Every guard (only the initiator can confirm; can't process before
+confirming; can't fail a completed session) lives as a method on the
+aggregate that throws on misuse. See [docs/state-diagram.md](state-diagram.md)
+for the full transition map this produces.
 
 ## Why the plan supports partial confirmation
 
-The obvious v1 design is all-or-nothing confirmation. It doesn't match how
-users actually review a bulk plan (some rows might be wrong; users approve
-what they trust and leave the rest for the next upload). `Confirm` takes a
-selection, not a boolean, and item-level results (not just session-level
-success/failure) follow directly from that — a batch where 3 of 400 items
+Users review a bulk plan and approve what they trust, not all-or-nothing.
+`Confirm` takes a selection, not a boolean; item-level results (not just
+session-level success/failure) follow directly — a batch where a few items
 fail their pre-action is a normal outcome, not an error state.
 
 ## Why the executor and the store are separate ports
 
 <a name="persistence"></a>
 
-It's tempting to fold "how work gets scheduled" and "where session state
-lives" into one abstraction — they're both about durability, sort of. They
-were kept separate because they vary independently:
-
-- `IUploadStore` durability depends on your database.
-- `IUploadExecutor` durability depends on your scheduling infrastructure
-  (in-process background service today; a real queue once available).
-
-Conflating them would mean the store implementation dictates executor
-choice or vice versa, which isn't true — you can have a durable store with
-a non-durable executor (this package's current default) or the reverse.
+They vary independently: `IUploadStore` durability depends on your
+database; `IUploadExecutor` durability depends on your scheduling
+infrastructure (in-process today, a real queue once available).
+Conflating them would mean one dictates the other, which isn't true.
 
 ## Known limitations
 
 <a name="known-limitations"></a>
 
 **The default executor is single-pod and loses in-flight work on restart —
-except after the first successful parse.** `BackgroundServiceUploadExecutor`
-queues work items in an in-memory `Channel`. If the pod restarts:
+except after Prepare+Parse succeed once.** `BackgroundServiceUploadExecutor`
+queues work items in an in-memory `Channel`. A session whose `ContextJson`
+and `ParsedDataJson` are both already set is recoverable
+(`StaleSessionReconciler` re-enqueues revalidation). A session that hadn't
+reached that point is not — the raw file bytes only ever existed in the
+in-memory queue. This disappears entirely once `IUploadExecutor` gets a
+durable-queue implementation; nothing else in the package needs to change,
+by design (see [Ports](#why-the-executor-and-the-store-are-separate-ports)).
 
-- A session whose file was already parsed (`ParsedDataJson` is set) is
-  recoverable — `StaleSessionReconciler` re-enqueues it.
-- A session whose file was *not yet* parsed is not recoverable — the raw
-  file bytes only ever existed in the in-memory queue. The reconciler fails
-  these sessions with a message asking the user to re-upload.
+**Dry-run cannot verify external, non-transactional side effects.** Real
+database constraints are exercised via a rolled-back transaction; calls to
+external systems (e.g. a provider API pre-action) either don't run in
+dry-run mode or run for real with no way to undo them.
 
-This is an accepted trade-off under a real constraint (no durable queue
-infrastructure currently available to the consuming team — see the
-project's upload proposal history for context), not an oversight. It
-disappears entirely once `IUploadExecutor` gets a durable-queue
-implementation; nothing else in the package needs to change, by design
-(see [Ports](#why-the-executor-and-the-store-are-separate-ports) above).
-
-**Dry-run cannot verify external, non-transactional side effects.** The
-`isDryRun` flag lets `IUploadProcessor` run inside a transaction that's
-always rolled back, which genuinely exercises database constraints. It
-cannot do the same for calls to external systems (e.g. a provider API
-pre-action) — those either don't run in dry-run mode, or run for real with
-no way to undo them. Pipeline authors must document this gap per pipeline;
-the package cannot close it generically.
-
-**No partial resumability within a failed session.** If processing fails
-partway through, the whole confirmed plan goes back to `PendingConfirmation`
-for re-confirmation — there's no "resume from item 47." This was a
-deliberate simplicity choice (see alternatives below), not a limitation the
-package is trying and failing to work around.
+**No partial resumability within a failed session.** A failed processing
+run goes back to `PendingConfirmation` for re-confirmation of the same
+plan — there's no "resume from item 47." Deliberate simplicity choice, not
+an unintended gap.
 
 ## Alternatives considered and rejected
 
-**Per-item resumability instead of whole-session retry.** Would require
-tracking which individual items succeeded before a crash and replaying only
-the remainder — meaningfully more complex, and only pays off if plans are
-large enough that redoing the whole batch is expensive. Rejected for v1;
-revisit if plan sizes grow to where this becomes a real cost, not a
-theoretical one.
+**Keeping `PreProcess` and adding a doc comment to disambiguate from
+`Process`.** Considered and rejected — a naming collision that needs a
+comment to explain is still a naming collision; renaming the type is a
+smaller, more permanent fix than permanently annotating around the problem.
 
-**Keyed DI for the pipeline registry.** .NET 8 introduced keyed service
-registration, which would be a more idiomatic way to resolve "one pipeline
-per string key." Rejected because it's unavailable on `net6.0`, one of the
-three supported target frameworks — the hand-rolled
-`IUploadPipelineRegistry` (a linear scan over `IEnumerable<IUploadPipeline>`)
-works identically across all three TFMs with no conditional compilation.
-Revisit if `net6.0` support is ever dropped.
+**Per-item resumability instead of whole-session retry.** Rejected for v1;
+only pays off if plan sizes grow large enough that redoing a whole batch is
+genuinely expensive.
+
+**Keyed DI for the pipeline registry.** Rejected — unavailable on `net6.0`.
 
 **Bundling ClosedXML (or any parser) into the core package.** Rejected —
-every consumer of the core package would inherit that dependency whether or
-not they parse Excel. Parsing-technology-specific helpers belong in a
-separate optional package (e.g. `FlowX.Upload.Excel`), following the same
-reasoning that put EF Core in its own `FlowX.Upload.EntityFrameworkCore`
-package rather than core.
+every consumer would inherit the dependency whether or not they parse Excel.
 
 ## Multi-targeting
 
 <a name="multi-targeting"></a>
 
-`net6.0;net8.0;net10.0`, with zero conditional compilation in the core
-package. Every design decision above that touches API compatibility (the
-pipeline registry being the clearest example) was made specifically to
-preserve this. If a future change seems to require an `#if` branch, treat
-that as a signal to look for a shared implementation first — see
-[CONTRIBUTING.md](../CONTRIBUTING.md) before adding one.
+`net6.0;net8.0;net10.0`, zero conditional compilation in the core package.
+This rename touched no API compatibility constraint — it's a pure naming
+change, verified against all three TFMs the same as any other change per
+`CONTRIBUTING.md`.

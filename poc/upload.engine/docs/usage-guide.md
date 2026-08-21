@@ -1,76 +1,88 @@
 # Usage Guide — Implementing a New Upload Pipeline
 
-This walks through adding a new bulk-upload use case end to end. It follows
-the same steps used to build the reference inventory bulk-upload pipeline —
-substitute your own domain types where noted.
-
-## 1. Define your parsed shape
-
-Pick whatever intermediate representation makes sense between "raw file"
-and "validated business data." It doesn't need to be your domain model —
-usually it's closer to the raw row shape, so validation errors can point
-back to specific sheet/row/field locations.
+## 1. Define your context and parsed shapes
 
 ```csharp
+public sealed record MyContext(string SchemaVersion); // or EmptyUploadContext if you need nothing extra
 public sealed record MyRawRow(int SheetIndex, int RowNumber, string? SomeField, /* ... */);
 ```
 
-## 2. Implement `IUploadParser<TParsed>`
+## 2. Implement `IUploadContextPreparer<TContext>` (Stage 1: Prepare)
 
-Converts a file `Stream` into your parsed shape. Nothing else — no
-validation, no business rules.
+Runs first, resolves anything durable your later stages need — a schema
+version, a resolved reference list, whatever doesn't fit in the file
+itself. If you don't need this, use the package-provided
+`EmptyContextPreparer` / `EmptyUploadContext` instead of writing your own.
 
 ```csharp
-public sealed class MyParser : IUploadParser<IReadOnlyCollection<MyRawRow>>
+public sealed class MyContextPreparer : IUploadContextPreparer<MyContext>
 {
-    public Task<IReadOnlyCollection<MyRawRow>> ParseAsync(Stream file, CancellationToken ct)
+    public Task<MyContext> PrepareAsync(Stream fileStream, string ownerContext, string initiatedBy, CancellationToken ct)
     {
-        // e.g. ClosedXML for Excel — see FlowX.Upload.Excel if you need shared helpers
+        // e.g. sniff a header row for a schema version, resolve a reference list, etc.
         ...
     }
 }
 ```
 
-## 3. Implement `IUploadPreProcessor<TParsed>`
+`TContext` must be a plain serializable type — no open resources, no
+`Stream` references — since it's persisted as JSON immediately after
+`Prepare` runs.
 
-Two responsibilities: validate, and — if valid — build the plan.
+## 3. Implement `IUploadParser<TContext, TParsed>` (Stage 2: Parse)
+
+Converts a file `Stream`, plus the context resolved in Stage 1, into your
+parsed shape. Nothing else — no validation, no business rules.
 
 ```csharp
-public sealed class MyPreProcessor : IUploadPreProcessor<IReadOnlyCollection<MyRawRow>>
+public sealed class MyParser : IUploadParser<MyContext, IReadOnlyCollection<MyRawRow>>
 {
-    public async Task<PreProcessResult> ProcessAsync(IReadOnlyCollection<MyRawRow> rows, CancellationToken ct)
+    public Task<IReadOnlyCollection<MyRawRow>> ParseAsync(Stream fileStream, MyContext context, CancellationToken ct)
+    {
+        ...
+    }
+}
+```
+
+## 4. Implement `IUploadPlanner<TParsed>` (Stage 3: Plan)
+
+**Renamed from `IUploadPreProcessor<TParsed>`.** Two responsibilities:
+validate, and — if valid — build the plan.
+
+```csharp
+public sealed class MyPlanner : IUploadPlanner<IReadOnlyCollection<MyRawRow>>
+{
+    public async Task<PlanResult> PlanAsync(IReadOnlyCollection<MyRawRow> rows, CancellationToken ct)
     {
         var errors = Validate(rows);
         if (errors.Count > 0)
-            return PreProcessResult.ValidationFailed(errors);
+            return PlanResult.ValidationFailed(errors);
 
         var planItems = BuildPlan(rows); // your Create/Update/Delete diffing logic
-        return PreProcessResult.Plan(planItems);
+        return PlanResult.Success(planItems);
     }
 }
 ```
 
 **Validate before touching any external system.** If validation needs data
-from a database or external API (as the inventory pipeline does, checking
-the provider catalog), do that after the basic field-level checks pass —
-don't spend an external call on a row that's already known to be invalid.
+from a database or external API, do that after basic field-level checks
+pass — don't spend an external call on a row already known to be invalid.
 
-**PlanItem payloads are opaque JSON.** Only your pre-processor and processor
+**`PlanItem` payloads are opaque JSON** — only your planner and processor
 agree on their shape:
 
 ```csharp
 new PlanItem(Guid.NewGuid(), PlanItemKind.Create, JsonSerializer.Serialize(myPayload), preActionJson, "human-readable description")
 ```
 
-## 4. Implement `IUploadProcessor`
+## 5. Implement `IUploadProcessor` (Stage 4: Process)
 
-Executes the confirmed (possibly partially-selected) plan. Two rules that
-are contractual, not optional:
+Executes the confirmed (possibly partially-selected) plan.
 
-- **Commit per chunk, not per whole plan.** Partial success is expected —
-  return item-level results, don't throw for a single item's failure.
-- **Support dry-run.** Run real writes inside a transaction, and roll it
-  back when `isDryRun` is true, so real constraints are still exercised.
+- **Commit per chunk, not per whole plan.** Return item-level results,
+  don't throw for a single item's failure.
+- **Support dry-run.** Run real writes inside a transaction, roll back when
+  `isDryRun` is true.
 
 ```csharp
 public sealed class MyProcessor : IUploadProcessor
@@ -90,7 +102,7 @@ public sealed class MyProcessor : IUploadProcessor
                 if (!await TryExecutePreAction(item, isDryRun, ct))
                 {
                     results.Add(new PlanItemResult(item.Id, false, "Pre-action failed."));
-                    continue; // does not block the rest of the chunk
+                    continue;
                 }
                 ApplyToChangeTracker(item);
                 succeeded.Add(item);
@@ -106,82 +118,73 @@ public sealed class MyProcessor : IUploadProcessor
 }
 ```
 
-If any external, non-transactional side effect (calling another API) is
-part of a pre-action, document explicitly that dry-run cannot verify it —
-see [docs/design.md](design.md#known-limitations).
-
-## 5. (Optional) Implement `IUploadCorrector<TParsed>`
+## 6. (Optional) Implement `IUploadCorrector<TContext, TParsed>`
 
 Only needed if you want users to fix invalid rows from the UI instead of
-re-uploading. Applies field-level patches to your parsed shape.
+re-uploading. Now receives `TContext` alongside the parsed data, in case
+correction logic needs it.
 
 ```csharp
-public sealed class MyCorrector : IUploadCorrector<IReadOnlyCollection<MyRawRow>>
+public sealed class MyCorrector : IUploadCorrector<MyContext, IReadOnlyCollection<MyRawRow>>
 {
     public IReadOnlyCollection<MyRawRow> ApplyCorrections(
-        IReadOnlyCollection<MyRawRow> parsed, IReadOnlyCollection<RowCorrection> corrections)
+        IReadOnlyCollection<MyRawRow> parsed, MyContext context, IReadOnlyCollection<RowCorrection> corrections)
     {
         // Match corrections to rows by (SheetIndex, RowNumber), apply by Field name.
-        // MUST be idempotent — a correction submitted twice must not double-apply.
+        // MUST be idempotent.
     }
 }
 ```
 
 If you skip this, a `ValidationFailed` session can only be resolved by
-re-uploading the file — `SubmitCorrectionsAsync` will throw
-`NotSupportedException`.
+re-uploading the file — `SubmitCorrectionsAsync` throws `NotSupportedException`.
 
-## 6. Register the pipeline
+## 7. Register the pipeline
 
 ```csharp
 services
     .AddFlowXUpload()
-    .AddPipeline<IReadOnlyCollection<MyRawRow>>("my-domain.my-upload", pipeline => pipeline
+    .AddPipeline<MyContext, IReadOnlyCollection<MyRawRow>>("my-domain.my-upload", pipeline => pipeline
+        .UsePreparer<MyContextPreparer>()
         .UseParser<MyParser>()
-        .UsePreProcessor<MyPreProcessor>()
+        .UsePlanner<MyPlanner>()          // renamed from UsePreProcessor
         .UseProcessor<MyProcessor>()
-        .UseCorrector<MyCorrector>()); // omit if you skipped step 5
+        .UseCorrector<MyCorrector>());     // omit if you skipped step 6
 ```
 
-Pick a stable, descriptive key (`"<domain>.<use-case>"`). It's a plain
-string with no compile-time check — consider exposing it as a `const string`
-in your application to reduce the risk of a typo causing a confusing
-"pipeline not found" error at runtime.
+No extra context needed? Swap in the defaults:
 
-## 7. Register a store
+```csharp
+.AddPipeline<EmptyUploadContext, IReadOnlyCollection<MyRawRow>>("my-domain.my-upload", pipeline => pipeline
+    .UsePreparer<EmptyContextPreparer>()
+    .UseParser<MyParser>()   // now IUploadParser<EmptyUploadContext, ...>
+    .UsePlanner<MyPlanner>()
+    .UseProcessor<MyProcessor>());
+```
+
+## 8. Register a store
 
 ```csharp
 services.AddEfCoreUploadStore(services, opts => opts.UseSqlServer(connectionString));
-// or implement IUploadStore yourself against your own persistence technology
 ```
 
-## 8. Wire the API
+If you're upgrading an existing deployment, see
+[docs/design.md](design.md#the-preprocess--plan-rename) for the **required
+one-time data migration** on the `Status` column before deploying.
 
-Five endpoints, all thin — `UploadOrchestrator` and `IUploadStore` do the work.
+## 9. Wire the API
 
-| Method | Path | Calls |
-|---|---|---|
-| POST | `/my-uploads` | `orchestrator.StartAsync(...)` |
-| GET | `/uploads/{id}` | `store.GetAsync(...)` |
-| POST | `/uploads/{id}/corrections` | `orchestrator.SubmitCorrectionsAsync(...)` |
-| POST | `/uploads/{id}/confirm` | `orchestrator.ConfirmAsync(...)` |
-| POST | `/uploads/{id}/retry` | `orchestrator.RetryAsync(...)` |
+Unchanged — five thin endpoints backed by `UploadOrchestrator` and
+`IUploadStore`. See [docs/sequence-diagrams.md](sequence-diagrams.md) for
+exactly when each is called.
 
-See [docs/sequence-diagrams.md](sequence-diagrams.md) for exactly when each
-is called relative to background work.
+## 10. Test
 
-## 9. Test
-
-At minimum:
-
-- **Pre-processor**: exhaustive Create/Update/Delete classification cases —
-  this is almost always the highest-risk logic in a new pipeline.
-- **Processor**: a case where one item's pre-action fails — assert the rest
-  of the chunk still commits, and the failure surfaces as a `PlanItemResult`,
-  not an exception.
+- **Planner**: exhaustive Create/Update/Delete classification cases.
+- **Processor**: a case where one item's pre-action fails — rest of the
+  chunk still commits, failure surfaces as a `PlanItemResult`.
 - **Corrector** (if implemented): applying the same correction twice
   produces the same result as applying it once.
 
-The orchestrator, aggregate, and reconciler are already covered by the
-package's own test suite — you don't need to re-test package behavior, only
-your pipeline's implementation of the four ports above.
+The orchestrator, aggregate, and reconciler are covered by the package's
+own test suite.

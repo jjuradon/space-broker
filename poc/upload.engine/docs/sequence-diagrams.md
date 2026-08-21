@@ -1,15 +1,8 @@
 # Sequence Diagrams
 
-Three flows, chosen because they're structurally distinct — not every branch
-of the state machine gets its own diagram, only the ones that actually
-differ in shape. Dry-run follows the same shape as the happy path with one
-change (rollback instead of commit at the final step); it's called out as a
-note on that diagram rather than duplicated.
+Same three flows as before; method/status names updated for the Plan rename.
 
 ## 1. Happy path — start to completion
-
-Covers: async accept, background parse/validate, status polling, partial
-confirmation, background processing.
 
 ```mermaid
 sequenceDiagram
@@ -23,17 +16,20 @@ sequenceDiagram
 
     User->>API: POST /uploads (file, dryRun)
     API->>Orch: StartAsync(...)
-    Orch->>Store: SaveAsync(session: PreProcessing)
-    Orch->>Exec: EnqueuePreProcessingAsync
+    Orch->>Store: SaveAsync(session: Planning)
+    Orch->>Exec: EnqueuePlanningAsync
     Orch-->>API: sessionId
     API-->>User: 202 Accepted { sessionId }
 
-    Exec->>Orch: RunPreProcessingAsync
-    Orch->>Pipe: ParseAsync(file)
+    Exec->>Orch: RunPlanningAsync
+    Orch->>Pipe: PrepareAsync(fileStream, ownerContext, initiatedBy)
+    Pipe-->>Orch: context
+    Orch->>Store: SaveAsync(ContextJson)
+    Orch->>Pipe: ParseAsync(fileStream, context)
     Pipe-->>Orch: parsed data
     Orch->>Store: SaveAsync(ParsedDataJson)
-    Orch->>Pipe: PreProcessAsync(parsed)
-    Pipe-->>Orch: Plan(items)
+    Orch->>Pipe: PlanAsync(parsed)
+    Pipe-->>Orch: PlanResult.Success(items)
     Orch->>Store: SaveAsync(session: PendingConfirmation)
 
     loop Poll every ~2s
@@ -58,15 +54,10 @@ sequenceDiagram
     API-->>User: status=Completed, results
 ```
 
-**Dry-run note:** identical flow. The only change is the final DB step —
-`ProcessAsync` still executes real writes against a transaction (so genuine
-constraints, like a unique-date index, are exercised), but that transaction
-is always rolled back rather than committed when `session.IsDryRun` is true.
+**Dry-run note:** identical flow; only the final DB step's commit/rollback
+changes based on `session.IsDryRun`.
 
 ## 2. Correction loop — fix without re-upload
-
-Picks up from the `PreProcessAsync` step above, but this time validation
-fails.
 
 ```mermaid
 sequenceDiagram
@@ -77,10 +68,10 @@ sequenceDiagram
     participant Exec as BackgroundServiceUploadExecutor
     participant Pipe as IUploadPipeline
 
-    Note over Orch,Pipe: Continues from PreProcessing — validation fails this time
+    Note over Orch,Pipe: Continues from Planning — PlanAsync returns a validation failure this time
 
-    Orch->>Pipe: PreProcessAsync(parsed)
-    Pipe-->>Orch: ValidationFailed(errors)
+    Orch->>Pipe: PlanAsync(parsed)
+    Pipe-->>Orch: PlanResult.ValidationFailed(errors)
     Orch->>Store: SaveAsync(session: ValidationFailed, errors)
 
     User->>API: GET /uploads/{id}
@@ -88,28 +79,25 @@ sequenceDiagram
 
     User->>API: POST /uploads/{id}/corrections
     API->>Orch: SubmitCorrectionsAsync(corrections)
-    Orch->>Store: SaveAsync(session: PreProcessing, PendingCorrections)
+    Orch->>Store: SaveAsync(session: Planning, PendingCorrections)
     Orch->>Exec: EnqueueRevalidationAsync
     API-->>User: 202 Accepted
 
     Exec->>Orch: RunRevalidationAsync
     Orch->>Store: GetAsync(session)
+    Orch->>Pipe: DeserializeContext(ContextJson)
     Orch->>Pipe: DeserializeParsedData(ParsedDataJson)
-    Orch->>Pipe: ApplyCorrections(parsed, corrections)
+    Orch->>Pipe: ApplyCorrections(parsed, context, corrections)
     Pipe-->>Orch: corrected parsed data
     Orch->>Store: SaveAsync(ParsedDataJson = corrected)
-    Orch->>Pipe: PreProcessAsync(corrected)
-    Pipe-->>Orch: Plan(items)
+    Orch->>Pipe: PlanAsync(corrected)
+    Pipe-->>Orch: PlanResult.Success(items)
     Orch->>Store: SaveAsync(session: PendingConfirmation)
 
-    Note over User,Store: No file re-upload required — the original file's<br/>bytes are never needed again after the first successful parse
+    Note over User,Store: No file re-upload required — the original file's bytes<br/>are never needed again after Prepare+Parse complete once
 ```
 
 ## 3. Crash recovery — pod restart during an in-flight session
-
-Runs once, on host startup, for every session — not triggered by any user
-action. This is what makes the single-pod / no-durable-queue constraint
-survivable.
 
 ```mermaid
 sequenceDiagram
@@ -125,27 +113,26 @@ sequenceDiagram
     Store-->>Reconciler: [stale sessions]
     loop each stale Processing session
         Reconciler->>Store: session.MarkFailed(...); SaveAsync
-        Note right of Reconciler: No partial resumability by design —<br/>user re-confirms and retries the same plan
     end
 
     Reconciler->>Store: GetByStatusOlderThanAsync(Confirmed, 10m)
     Store-->>Reconciler: [stale sessions]
     loop each stale Confirmed session
         Reconciler->>Exec: EnqueueProcessingAsync(sessionId)
-        Note right of Reconciler: Plan is durable — only the in-memory<br/>enqueue was lost, safe to redo
     end
 
-    Reconciler->>Store: GetByStatusOlderThanAsync(PreProcessing, 10m)
+    Reconciler->>Store: GetByStatusOlderThanAsync(Planning, 10m)
     Store-->>Reconciler: [stale sessions]
-    loop each stale PreProcessing session
-        alt ParsedDataJson is set
+    loop each stale Planning session
+        alt ContextJson and ParsedDataJson are both set
             Reconciler->>Exec: EnqueueRevalidationAsync(sessionId)
-        else ParsedDataJson is null
+            Note right of Reconciler: Prepare+Parse already succeeded —<br/>only the Plan step was interrupted
+        else either is null
             Reconciler->>Store: session.MarkFailed("please re-upload"); SaveAsync
             Note right of Reconciler: Known gap — raw file bytes only ever<br/>lived in the in-memory queue, unrecoverable
         end
     end
 ```
 
-See [docs/design.md](design.md#known-limitations) for why the
-`ParsedDataJson is null` branch exists and what would remove it.
+See [docs/design.md](design.md#known-limitations) for why the `else`
+branch exists and what would remove it.
