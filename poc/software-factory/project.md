@@ -1,62 +1,82 @@
 # Software Factory: Project Plan
 
-**Version:** 1.1 (proposed refinement of the 1.0 frozen baseline)
+**Version:** 1.2
 **Date:** 2026-10-20
-**Status:** Ready for Phase 0 (probes gate Phase 1)
-**Primary surfaces:** VS Code Agents window, Copilot harness (primary); Copilot CLI (secondary) [R1]
+**Status:** Ready for Phase 0
+**Primary surfaces:** VS Code 1.141 Agents window, Copilot harness (primary); Copilot CLI (secondary)
 
 ---
 
 ## 1. What This Project Is
 
-A **software factory** for the GitHub Copilot ecosystem: a request goes in, a reviewed and committed implementation comes out.
+A **software factory** for the GitHub Copilot ecosystem: a request goes in, a reviewed and committed implementation comes out. The whole system is built from scratch under this plan.
 
-The factory is a **thin, deterministic orchestration layer** inspired by two reference designs:
+It is a thin, deterministic orchestration layer inspired by two reference designs:
 
-- **Matt Pocock's Sandcastle**: role-based pipelines with per-agent branch/sandbox isolation.
-- **Uncle Bob's SwarmForge**: six-role pipeline with durable, commit-backed JSON handoffs.
+- **Matt Pocock's Sandcastle:** role-based pipelines with per-agent branch/sandbox isolation.
+- **Uncle Bob's SwarmForge:** six-role pipeline with durable, commit-backed JSON handoffs.
 
-Neither reference is copied. The factory is built only on **documented, non-experimental, version-pinned** primitives: user-level custom agents, an optional skill, git worktrees, driver-authored JSON handoffs, and a Python driver and dashboard. [R4]
+Neither is copied. The factory uses only documented, non-experimental, version-pinned primitives: user-level custom agents, a skill, git worktrees, driver-written JSON handoffs, and a Python driver and dashboard.
 
 ### 1.1 The one-sentence goal
 
-> Given a feature request or bug fix, run it through a role-separated pipeline of Copilot agents, each in its own git worktree chained from the previous role's commit, each recorded as a driver-written, git-backed JSON handoff, and produce a reviewed, committed, mergeable result branch with a post-run dashboard. [R6][R8][R9]
+> Given a feature request or bug fix, run it through a role-separated pipeline of Copilot agents, each in its own git worktree chained from the previous role's commit, each recorded as a driver-written, git-backed JSON handoff, and produce a reviewed, committed, mergeable result branch with a post-run dashboard.
 
 ---
 
 ## 2. Intended Use
 
-### 2.1 Primary use: VS Code Agents window
+### 2.1 Primary use: VS Code 1.141 Agents window
 
-1. Select the **Copilot** harness in Session Target and the `factory-orchestrator` agent. [R1]
+1. Select the **Copilot** harness and the `factory-orchestrator` agent.
 2. Prompt, for example:
-   - `Implement requests/add-oauth.md using the six-pack workflow.`
-   - `Fix the null check in src/utils/parse.ts using the two-pack workflow.`
-3. The orchestrator states the chosen pack and reason, then runs `factory run --request … --pack …`. [R5][R18]
-4. Six-pack: when the specifier finishes, the driver exits with code 20 (`awaiting_approval`). Run `factory approve --run-id <id>` (or `--reject --reason …`), then `factory resume --run-id <id>`. [R5]
+   - `Implement requests/add-oauth.md.` (no flow stated, so the six-pack runs)
+   - `Fix the null check in src/utils/parse.ts without deep flow.` (two-pack)
+   - `Implement requests/add-oauth.md as a simple task.` (two-pack)
+3. The orchestrator passes your prompt text verbatim to `factory resolve-pack`, states the resolved pack and why, then runs `factory run --pack <resolved>`.
+4. Six-pack: after the specifier, the driver exits with code 20 (`awaiting_approval`). Run `factory approve --run-id <id>` (or `--reject --reason …`), then `factory resume --run-id <id>`.
 5. Inspect with `factory dashboard --run-id <id>`.
 
 ### 2.2 Secondary use: Copilot CLI
 
 ```bash
-factory run --request requests/add-oauth.md --pack six-pack      # --pack is required [R18]
-factory run --request requests/fix-null.md  --pack two-pack
+factory run --request requests/add-oauth.md                    # no --pack: six-pack default
+factory run --request requests/fix-null.md --pack two-pack     # name or alias accepted
+factory run --request requests/fix-null.md --pack "simple task"
+factory resolve-pack --text "fix it without deep flow"         # prints the resolution as JSON
 factory approve   --run-id <id>
 factory resume    --run-id <id>
 factory clean     --run-id <id>
 factory dashboard --run-id <id> [--json]
 ```
 
-### 2.3 Workflows
+### 2.3 Workflows and pack aliases
 
 | Pack | Roles | When |
 |---|---|---|
-| **Two-pack** | `coder → cleaner` | Single-file fix, localized bug, small test addition |
-| **Six-pack** | `specifier → coder → cleaner → architect → hardender → qa` | New feature, multi-module change, public API or architecture |
+| **Six-pack (default)** | `specifier → coder → cleaner → architect → hardender → qa` | Anything not explicitly marked simple |
+| **Two-pack** | `coder → cleaner` | Only when explicitly requested by name or alias |
 
-Pack order lives in one driver-owned file, `packs.json`. It is not duplicated in agent profiles. [R11]
+**Alias resolution** is implemented once, in the driver, from `packs.json`. It applies to the `--pack` flag and to the user's prompt text, not to the contents of the request file, so a phrase inside a request cannot change the flow by accident.
 
-**Classification:** the orchestrator proposes a pack. The CLI never classifies, so `--pack` is mandatory. If neither pack fits (empty or unreadable request, non-code task), the orchestrator replies `no_pack` with a reason and runs nothing. A wrong pack is corrected by re-running with the other pack. A two-pack role can stop with `blocked/escalate_pack`. [R18]
+Default alias table (editable in `packs.json`):
+
+| Pack | Aliases |
+|---|---|
+| six-pack | `six-pack`, `six pack`, `deep flow`, `full flow` |
+| two-pack | `two-pack`, `two pack`, `without deep flow`, `no deep flow`, `simple task`, `simple flow`, `light flow` |
+
+Rules:
+
+1. An explicit `--pack` value (name or alias) wins over text matching.
+2. Matching is case-insensitive, whole-phrase, **longest phrase first**. A matched span is consumed, so `without deep flow` does not also match the six-pack alias `deep flow`.
+3. Aliases are multi-word on purpose. Bare words like "simple" or "quick" are not aliases, because "simple login feature" must not silently drop the review stages.
+4. No match gives the **six-pack**. If both packs match, the six-pack wins with reason `conflict_defaulted`.
+5. The resolution (`pack`, `matched_alias`, `reason`) is recorded in `run.json` and shown at run start.
+
+A wrong pack is corrected by re-running with the other alias. A two-pack role can also stop with `blocked/escalate_pack`; the user then re-runs on the six-pack, and branches from the aborted run are kept.
+
+If the request file is missing, unreadable or empty, the orchestrator replies `no_request` and runs nothing.
 
 ### 2.4 Multi-repo
 
@@ -68,7 +88,7 @@ Config lives at user level:
 └── skills/software-factory/ (SKILL.md, CONSTITUTION.md, HANDOFF-SCHEMA.md)
 ```
 
-Agent filename must equal frontmatter `name`; no symlinked agent or skill directories. [R2] The skill is optional: the pipeline must work without it. [R3] Repos only need Git worktree capability and a writable parent directory.
+Agent filename must equal frontmatter `name`. Install by **copying**, never symlinking (a symlink-discovery bug has been reported for agents and skills). The skill is not load-bearing: the pipeline must work if it does not load. Repos need only Git worktree capability and a writable parent directory.
 
 ---
 
@@ -76,25 +96,27 @@ Agent filename must equal frontmatter `name`; no symlinked agent or skill direct
 
 ### 3.1 Primary goals
 
-- **G1 Request-to-result pipeline** with no manual orchestration in the happy path (the approval gate is the one deliberate stop).
-- **G2 Role separation that is declared, constrained and audited.** Tool lists are declared per profile. `execute` is shell access and can write, so restrictions are backed by `--deny-tool` flags, a prompt boundary and a driver post-role audit. [R7]
-- **G3 Durable, git-backed handoffs.** Every transition is a JSON file the driver commits to a driver-owned `_handoffs` repo. [R8]
-- **G4 Session isolation via git worktrees**, one per role, chained from the previous role's commit. [R9]
+- **G1 Request-to-result pipeline** with no manual orchestration in the happy path. The approval gate is the one deliberate stop.
+- **G2 Role separation that is declared, constrained and audited.** Tool lists are declared per profile. `execute` is shell access and can write, and dispatch runs with allow-all flags, so enforcement is **driver audit after every role**, not prevention.
+- **G3 Durable, git-backed handoffs.** Every transition is a JSON file the driver commits to a driver-owned `_handoffs` repo.
+- **G4 Session isolation via git worktrees**, one per role, chained from the previous role's commit.
 - **G5 Two operational surfaces** sharing the same user-level agent definitions.
 - **G6 Post-run observability** from disk artifacts alone.
+- **G7 Simple flow selection** through the deterministic alias rules in §2.3.
 
 ### 3.2 Secondary goals (later phases)
 
-G7 real-time dashboard; G8 Node front end on the stable JSON contract; G9 deeper VS Code Agents window integration.
+Real-time dashboard; Node front end on the stable JSON contract; deeper VS Code Agents window integration; evaluating Copilot sandboxing.
 
 ### 3.3 Explicit non-goals (v1)
 
 - No experimental Copilot features (`/fleet`, dynamic workflows, experimental subagent properties).
-- No VS Code `handoffs` frontmatter and no agent-to-agent delegation; the driver is the only dispatcher. [R5]
-- No container/sandbox isolation; no OS-level sandbox (the CLI has none that the docs claim). [R7]
-- No hidden retry engine; resume is an explicit human command. [R15]
+- No VS Code `handoffs` frontmatter and no agent-to-agent delegation. The driver is the only dispatcher, and the orchestrator has no `agent` tool.
+- No container or OS-level sandbox in v1.
+- No hidden retry engine. Resume is an explicit human command.
 - No per-repository configuration.
-- No custom GUI in v1.
+- No custom GUI.
+- No LLM-based pack classification. Selection is by alias rules.
 
 ---
 
@@ -104,42 +126,47 @@ G7 real-time dashboard; G8 Node front end on the stable JSON contract; G9 deeper
 
 | ID | Requirement |
 |---|---|
-| F1 | The orchestrator classifies a request and proposes two-pack or six-pack (or `no_pack`). The CLI requires `--pack`. [R18] |
-| F2 | Each role is dispatched by the driver, lazily, in its own worktree created from the previous role's commit (first role from `base_commit`). [R9] |
-| F3 | Each role attempt yields exactly one JSON handoff, **written by the driver** from the role's final JSON report. Fields are in §5.2. [R6][R11] |
-| F4 | A `completed` handoff must reference a commit reachable on the role branch. Edit roles: the driver commits residual changes, or uses an advanced HEAD, and a clean unchanged tree is `failed/no_changes`. Read-only roles: the tree must be clean and `commit` equals the start SHA. [R6] |
+| F1 | `factory resolve-pack` and `factory run` resolve the pack per §2.3. `--pack` is optional and defaults to the six-pack. The orchestrator always calls `resolve-pack` with the user's verbatim prompt. |
+| F2 | The driver dispatches each role lazily in its own worktree, created from the previous role's commit (the first from `base_commit`). |
+| F3 | Each role attempt yields exactly one JSON handoff **written by the driver** from the role's final JSON report. Fields are in §5.2. |
+| F4 | A `completed` handoff must reference a reachable commit. Edit roles: the driver commits residual changes or uses an advanced HEAD, and a clean unchanged tree is `failed/no_changes`. Read-only roles: the tree must be clean and `commit` equals the start SHA. |
 | F5 | `blocked` requires a coded reason. The driver stops (exit 10) and leaves worktrees. |
-| F6 | `needs_approval` (specifier) stops the run with exit 20. `factory approve` records `approvals/<step>.json`. `factory resume` continues. [R5] |
-| F7 | `state.json` is a pure function of `run.json`, `events.jsonl`, `_handoffs/` and `approvals/`, regenerated on every driver step. Agents never write it. [R12] |
-| F8 | At completion the driver removes worktrees with `git worktree remove`. A dirty worktree records `cleanup: dirty` and the driver stops without `--force`. `factory clean` is the explicit, lossless remedy. [R16] |
+| F6 | `needs_approval` (specifier) stops the run (exit 20). `factory approve` records `approvals/<step>.json`; `factory resume` continues. |
+| F7 | `state.json` is a pure function of `run.json`, `events.jsonl`, `_handoffs/` and `approvals/`, regenerated on every driver step. Agents never write it. |
+| F8 | At completion the driver removes worktrees with `git worktree remove`. A dirty worktree records `cleanup: dirty` and the driver stops without `--force`. `factory clean` is the explicit, lossless remedy: it commits residual changes as a `wip` commit on the role branch, then removes the worktree. |
 | F9 | The dashboard reconstructs the timeline from `state.json` and handoffs; `--json` emits the contract. |
-| F10 | The skill loads on matching requests where the surface supports it. It is non-load-bearing. [R3] |
-| F11 | Any status outside `completed/blocked/needs_approval`, a missing or invalid report, a crash, a timeout, or an audit violation yields `failed` with a `failure_class` (exit 30). [R14] |
-| F12 | `factory resume` is idempotent: it skips completed steps, marks worktrees without a handoff `interrupted`, and starts a new attempt without deleting old branches. [R13][R15] |
+| F10 | The skill loads on matching requests (verified), but the pipeline does not depend on it. |
+| F11 | Any status outside `completed/blocked/needs_approval`, a missing or invalid report, a crash, a timeout or an audit violation yields `failed` with a `failure_class` (exit 30). |
+| F12 | `factory resume` is idempotent: it skips completed steps, marks worktrees with no handoff `interrupted`, and starts a new attempt without deleting old branches. |
 
 ### 4.2 Non-functional requirements
 
 | ID | Requirement |
 |---|---|
-| N1 | Only documented, non-experimental primitives: `copilot --agent`, `-p`, user-level agent and skill discovery. No `--experimental`. CLI and Git versions are pinned after Phase 0. [R4] |
+| N1 | Only documented, non-experimental primitives. CLI, Git and VS Code versions are recorded in `docs/baseline.md` and in each `run.json`. |
 | N2 | Config is user-level under `~/.copilot/`; repos are not modified beyond worktree capability. |
-| N3 | Run root: `<repo-toplevel>/../.factory/<repo-name>/<run-id>/` containing `run.json`, `events.jsonl`, `state.json`, `_handoffs/`, `approvals/`, `wt/<role>/`. [R10] |
-| N4 | `_handoffs/` is a sibling of `wt/`, outside every working tree, and is a driver-owned git repo with one commit per handoff. Agents never read or write it; the driver injects the prior handoff into the next prompt. [R8] |
+| N3 | Run root: `<repo-toplevel>/../.factory/<repo-name>/<run-id>/` containing `run.json`, `events.jsonl`, `state.json`, `_handoffs/`, `approvals/`, `wt/<role>/`. |
+| N4 | `_handoffs/` is outside every working tree and is a driver-owned git repo with one commit per handoff. Agents never read or write it; the driver injects the prior handoff into the next prompt. |
 | N5 | Driver and dashboard in Python. `state.json` and handoffs carry `schema_version`; changes are additive-only; JSON Schemas ship with the driver. |
-| N6 | Agents never manage worktrees, branches or `state.json`. The driver owns lifecycle and audits compliance after each role. [R7] |
-| N7 | Branches are `factory/<run-id>/<role>` (aborted retries `…/<role>-a<n>`). [R9] |
-| N8 | Run-id is `YYYYMMDDTHHMMSSZ-<4hex>`; the run directory is claimed with an atomic `mkdir`. [R10] |
-| N9 | Driver exit codes: 0 completed, 10 blocked, 20 awaiting approval, 30 failed, 40 preflight failure. [R14] |
+| N6 | Agents never manage worktrees, branches or `state.json`. The driver audits compliance after each role. |
+| N7 | Branches are `factory/<run-id>/<role>`; retry attempts use `…/<role>-a<n>`. |
+| N8 | Run-id is `YYYYMMDDTHHMMSSZ-<4hex>`; the run directory is claimed with an atomic `mkdir`. |
+| N9 | Driver exit codes: 0 completed, 10 blocked, 20 awaiting approval, 30 failed, 40 preflight failure. |
+| N10 | Alias rules live only in `packs.json`. Agents and docs reference them and never redefine them. |
 
-### 4.3 Environment requirements
+### 4.3 Environment requirements and verified baseline
 
-| ID | Requirement |
+The following were verified by the project owner and are not re-probed. They are baseline facts, recorded in `docs/baseline.md` in Phase 0.2.
+
+| ID | Requirement / verified fact |
 |---|---|
-| E1 | Copilot CLI at or above the minimum version recorded in Phase 0.3 (the version where `~/.copilot/agents` user agents load and `--agent` works headless). Preflight checks it. [R2] |
-| E2 | VS Code with the **Copilot harness** selected in Session Target; user agents live in `~/.copilot/agents`. The `chat.agentFilesLocations` setting is not used (deprecated, Local harness only). [R1] |
-| E3 | Git with `worktree add --lock`, `list --porcelain`, `remove`, `repair`, `prune`; the minimum version is set in Phase 0.3, not assumed. [R21] |
-| E4 | Python 3.10+ with `rich` and a JSON-schema validator. |
-| E5 | The repo's parent directory is writable and allows worktrees outside the repo. |
+| E1 | Copilot CLI at the latest version at build time. User-level agents in `~/.copilot/agents` load and `copilot --agent` works (verified). The exact version is recorded; preflight fails below it. |
+| E2 | VS Code **1.141**, Copilot harness selected. User agents in `~/.copilot/agents` appear in the agent list (verified). The deprecated `chat.agentFilesLocations` setting is not used. |
+| E3 | Git at the latest version at build time (verified); the exact version is recorded. |
+| E4 | Skills in `~/.copilot/skills` are discovered (verified). |
+| E5 | **Headless dispatch needs allow flags.** Without allow-all, each new session triggers an access request (verified). The dispatch template therefore uses allow flags. Phase 0.3 finds the minimal set; the fallback is `--allow-all`. |
+| E6 | Python 3.10+ with `rich` and a JSON-schema validator. |
+| E7 | The repo's parent directory is writable, so worktrees can be created outside the repo. |
 
 ---
 
@@ -148,25 +175,24 @@ G7 real-time dashboard; G8 Node front end on the stable JSON contract; G9 deeper
 ### 5.1 Components
 
 ```
-VS Code Agents window (Copilot harness)      Copilot CLI
-              │                                   │
-              ▼                                   ▼
+VS Code 1.141 Agents window (Copilot harness)    Copilot CLI
+                │                                     │
+                ▼                                     ▼
  factory-orchestrator.agent.md  (read, search, execute: runs only `factory …`)
-   classify → propose pack → run `factory run --pack …`
-              │
-              ▼
+   verbatim prompt → `factory resolve-pack` → `factory run --pack <resolved>`
+                │
+                ▼
  factory.py  (the only dispatcher)
-   creates run dir + run.json, worktrees (lazy, chained), dispatches roles,
-   writes handoffs, audits, commits, derives state.json, tears down
-      │ writes                              │ calls (cwd = role worktree)
-      ▼                                     ▼
- _handoffs/ (git repo), approvals/,   copilot --agent=<role> -p <prompt> -s
- events.jsonl, state.json             + explicit --allow-tool / --deny-tool
-      │ read by                             │ runs in
-      ▼                                     ▼
- factory dashboard                    <run>/wt/<role>  (branch factory/<run-id>/<role>)
+   resolves pack, claims run dir, writes run.json, creates chained worktrees,
+   dispatches roles, writes handoffs, audits, commits, derives state.json, tears down
+      │ writes                                │ calls (cwd = role worktree)
+      ▼                                       ▼
+ _handoffs/ (git repo), approvals/,      copilot --agent=<role> -p <prompt> -s
+ events.jsonl, state.json                + allow flags (E5) + deny flags
+      │ read by                               │ runs in
+      ▼                                       ▼
+ factory dashboard                       <run>/wt/<role>  (branch factory/<run-id>/<role>)
 ```
-[R5][R17]
 
 ### 5.2 Handoff schema (v1, driver-written)
 
@@ -197,23 +223,24 @@ VS Code Agents window (Copilot harness)      Copilot CLI
 }
 ```
 
-- `to_role` is derived from `packs.json`; `broadcast` is the driver's `role_completed` event. [R11]
-- `artifacts` is verified against `git diff --name-only base_commit..commit`. [R7]
-- `blocked_reason` is `{code, detail}`; codes include `escalate_pack`, `needs_human`, `spec_ambiguous`. [R18]
-- Ordering is pack order; no inter-task dependencies in v1. `attempt` is the retry count. [R11]
-- File name is `<role>-<task_id>-a<attempt>.json`, created exclusively. State uses the highest attempt for a step; earlier attempts remain. [R13]
+- `to_role` is derived from `packs.json`; `broadcast` is the driver's `role_completed` event.
+- `artifacts` is verified against `git diff --name-only base_commit..commit`.
+- `blocked_reason` is `{code, detail}`; codes include `escalate_pack`, `needs_human`, `spec_ambiguous`.
+- Ordering is pack order; there are no inter-task dependencies in v1. `attempt` is the retry count.
+- File name is `<role>-<task_id>-a<attempt>.json`, created exclusively. State uses the highest attempt per step; earlier attempts stay on disk.
 
-**Role report** (the agent's final message, one JSON object, extracted and validated by the driver): `{status, notes, artifacts[], blocked_reason?}`. Missing or invalid → `failed/no_report` or `failed/invalid_report`. [R6]
+**Role report** is the agent's final message: one JSON object `{status, notes, artifacts[], blocked_reason?}`. The driver extracts and validates it. A missing or invalid report gives `failed/no_report` or `failed/invalid_report`.
 
 ### 5.3 State contract (Node-ready)
 
-`state.json` (in the run root) is derived from `run.json` (request, pack, planned steps, `base_commit`, `started_at`), `events.jsonl` (lifecycle, cleanup), `_handoffs/` and `approvals/`. [R12]
+`state.json` is derived from `run.json` (request, pack, `pack_resolution`, planned steps, `base_commit`, `started_at`, tool versions), `events.jsonl`, `_handoffs/` and `approvals/`.
 
 ```json
 {
   "schema_version": 1,
   "run_id": "20261020T142000Z-a3f1",
   "pack": "six-pack",
+  "pack_resolution": {"matched_alias": null, "reason": "default"},
   "request": "requests/add-oauth.md",
   "status": "completed",
   "started_at": "…", "finished_at": "…",
@@ -228,7 +255,7 @@ VS Code Agents window (Copilot harness)      Copilot CLI
 }
 ```
 
-Run `status` ∈ `running | awaiting_approval | blocked | failed | completed`. Planned-but-unrun roles appear as `pending`. [R12]
+Run `status` is one of `running | awaiting_approval | blocked | failed | completed`. Planned-but-unrun roles appear as `pending`.
 
 ### 5.4 Role definitions
 
@@ -242,69 +269,91 @@ Run `status` ∈ `running | awaiting_approval | blocked | failed | completed`. P
 | `hardender` | `read`, `edit`, `search`, `execute` | changes allowed; driver commits |
 | `qa` | `read`, `search`, `execute` | tree clean, no new commits |
 
-Pack order is in `packs.json`. [R7][R11]
+If you intended the cleaner to auto-fix rather than report, that is a scope change and needs your decision.
 
-Every agent's instruction block contains:
+Every role's instructions include:
 - "Your final message must be one JSON object matching the role-report schema in `HANDOFF-SCHEMA.md`."
-- "Work only inside your current worktree. Do not run `git worktree`, switch or delete branches, push, or touch other directories." [R7]
-- Read-only roles: "Do not modify files." The driver audits this.
+- "Work only inside your current worktree. Do not run `git worktree`, switch or delete branches, push, or touch other directories."
+- Read-only roles: "Do not modify files."
 
-**Dispatch template (per role):** cwd = role worktree; `copilot --agent=<role> -p "<boundary + prior handoff + request + report schema>" -s`, with explicit `--allow-tool` and `--deny-tool` lists per role (including `shell(git push)`, `shell(git worktree)`, branch-deletion patterns), and no `--allow-all` unless Phase 0.3 shows scoped flags cannot work. [R17]
+**Dispatch template (per role):** cwd = role worktree; `copilot --agent=<role> -p "<boundary + prior handoff + request + report schema>" -s` with the allow flags from E5 and the deny flags below.
+
+**Residual risk, accepted for v1:** with allow flags, the CLI's path scoping no longer confines the agent. Confinement relies on cwd, the prompt boundary, deny flags (if Phase 0.3 shows they still apply), and the post-role audit, which detects problems rather than preventing them. The audit checks, for every role:
+- main-repo HEAD and refs unchanged except the role branch;
+- other worktrees unchanged;
+- read-only roles left a clean tree and made no commits;
+- `git diff --name-only` matches the reported artifacts.
+
+A failure gives `failed/audit_violation`. The constitution tells users to run the factory only on repos and machines where this is acceptable.
 
 ---
 
 ## 6. Baseline Guidelines
 
-1. **User-level config, repo-level execution.** Agents and skills in `~/.copilot/`; the pipeline must not depend on the skill. [R3]
-2. **One handoff per role per attempt, written by the driver.** `state.json` is derived and overwritten each step, so any agent edit is discarded. [R12][R20]
-3. **Commit before completion, verified by the driver.** A `completed` handoff must reference a reachable commit, or the run fails with `missing_commit`. [R6][R20]
-4. **Worktrees and `_handoffs/` live in the run root outside the repo**, chained from the previous commit. [R9][R10]
-5. **Advance only on a validated handoff.** The driver advances when a handoff validates as `completed` and passes audit; there is no hidden retry engine. [R14][R20]
-6. **Driver owns lifecycle; agents own code.** Agents are told not to manage worktrees or branches, with deny flags, and the driver audits that refs, other worktrees and the main tree are unchanged. This is detection, not prevention. [R7][R20]
-7. **Documented primitives only, versions pinned.** `copilot --agent`, `-p`, `git worktree`, JSON files, Python. No experimental features. [R4][R20]
-8. **`state.json` is the Node contract**, with `schema_version`, JSON Schema files, and additive-only evolution. [R20]
-9. **Human gates are explicit.** `needs_approval` exits with code 20 and a visible message; `factory approve` / `resume` continue. `blocked` and `failed` stop and leave worktrees. [R5][R20]
+1. **User-level config, repo-level execution.** The skill is helpful, not load-bearing.
+2. **One handoff per role per attempt, written by the driver.** `state.json` is derived and overwritten each step, so any agent edit is discarded.
+3. **Commit before completion, verified by the driver.** A `completed` handoff must reference a reachable commit, or the run fails with `missing_commit`.
+4. **Worktrees and `_handoffs/` live in the run root outside the repo,** chained from the previous commit.
+5. **Advance only on a validated, audited handoff.** There is no hidden retry engine.
+6. **Driver owns lifecycle; agents own code.** Compliance is detected by audit, not prevented.
+7. **Documented primitives only, versions recorded.** No experimental features.
+8. **`state.json` is the Node contract,** with `schema_version`, JSON Schema files and additive-only evolution.
+9. **Human gates are explicit.** `needs_approval` exits 20; `factory approve` and `resume` continue. `blocked` and `failed` stop and leave worktrees.
+10. **Flow selection is deterministic.** Aliases are resolved by the driver from `packs.json`; default is the six-pack.
 
 ---
 
 ## 7. Implementation Plan
 
-### Phase 0: Foundation, scaffolding and contract probes
+Build order: every phase depends only on earlier phases. Driver increments are tested against a stand-in `copilot` script first, then against the real CLI.
+
+### Phase 0: Foundation and remaining probes (no factory tool exists yet)
 
 | Increment | Deliverable | Exit criterion |
 |---|---|---|
-| 0.1 | `~/.copilot/agents/` and `skills/software-factory/` scaffolds (filename = `name`, no symlinks) | Files exist [R2] |
-| 0.2 | Discovery on both surfaces: VS Code Copilot harness dropdown; `copilot --agent=factory-orchestrator`; skill loading checked per surface | Agent visible and invocable on both; skill result recorded per surface (non-blocking) [R1][R3] |
-| 0.3 | **Contract probes** (see §11 Open verifications) | Each probe has pass/fail recorded; minimum CLI and Git versions set; failures change the plan before Phase 1 [R21] |
+| 0.1 | Source repo layout: `factory/` (Python package), `agents/`, `skill/`, `schemas/`, `tests/`, `docs/`; an install script that **copies** agents and skill into `~/.copilot/` | Install is repeatable; filename = frontmatter `name` check passes |
+| 0.2 | `docs/baseline.md` recording the verified facts E1–E5 plus exact CLI, Git, VS Code (1.141) and Python versions | File committed; later preflight reads from it |
+| 0.3 | **Hand-run probes** using plain shell commands and stand-in scripts (see §11) | Each probe has a recorded result; the dispatch allow/deny flag set and the long-run launch method are decided |
 
-### Phase 1: Role definitions and report protocol
-
-| Increment | Deliverable | Exit criterion |
-|---|---|---|
-| 1.1 | `HANDOFF-SCHEMA.md` and JSON Schemas (handoff, role report, `state.json`, `run.json`) | Single source of truth [R11] |
-| 1.2 | Seven agent profiles with declared tools and boundary instructions; `packs.json` | Each profile loads; routing lives only in `packs.json` [R11] |
-| 1.3 | Orchestrator classification, `no_pack`, `--pack` surfacing | Two-pack run completes with valid driver-written handoffs; timeout value calibrated from measured runs [R14][R18] |
-
-### Phase 2: Worktree isolation and Python driver
+### Phase 1: Contracts and role profiles (no driver)
 
 | Increment | Deliverable | Exit criterion |
 |---|---|---|
-| 2.1 | Run-dir claim, `run.json`, lazy chained worktree creation (`--lock`), teardown | Six-pack creates six worktrees from a chain and removes all cleanly [R9][R10][R15] |
-| 2.2 | Dispatch loop: report extraction, schema validation, commit/audit, status contract, timeouts, exit codes | Driver never edits code; every failure class has a test [R6][R7][R14] |
-| 2.3 | `approve`, `resume`, `clean` commands | Kill the driver mid-run; `resume` completes without duplicate handoffs or lost branches [R13][R15][R16] |
-| 2.4 | `state.json` derivation and `_handoffs` git repo | State is valid, regenerated, and consumed by the dashboard unchanged [R8][R12] |
+| 1.1 | JSON Schemas (handoff, role report, `run.json`, `state.json`, `packs.json`) plus fixture files and validator tests | Valid fixtures pass, invalid fixtures fail |
+| 1.2 | Six role profiles with declared tools and boundary instructions; `packs.json` with aliases | Each profile loads; routing and aliases only in `packs.json` |
+| 1.3 | Manual dry-run of each role in a hand-made worktree on a fixture repo | Every role returns a schema-valid report; read-only roles leave a clean tree |
 
-### Phase 3: Post-run dashboard (v1)
+### Phase 2: Python driver, built from scratch in increments
 
 | Increment | Deliverable | Exit criterion |
 |---|---|---|
-| 3.1 | `factory dashboard` with `rich` and `--json` | Reconstructs any run from disk alone |
-| 3.2 | Failure report: blocking role, `failure_class`, reason, worktree paths, next command (`resume`/`clean`) | Blocked and failed runs are actionable [R14] |
-| 3.3 | Second-repo adoption check | Success 7 verified [R19] |
+| 2.1 | Skeleton: CLI (`run`, `resume`, `approve`, `clean`, `resolve-pack`), config, preflight, `packs.json` loader and alias resolver, atomic run-dir claim, `run.json`, `events.jsonl`, exit codes | Alias test table passes, including `without deep flow`, `simple task`, no-match default and conflict |
+| 2.2 | Worktree lifecycle: lazy chained creation with `--lock`, teardown, dirty handling, `clean` | Works on temp repos, including a failure injected mid-chain |
+| 2.3 | Single-role dispatch: template, timeout, report extraction and validation, commit and audit rules, handoff writing, `_handoffs` git repo | Every `failure_class` has a test against the stand-in; one real `coder` run passes |
+| 2.4 | Two-pack end to end from the CLI | Real two-pack run on a fixture repo yields two valid handoffs and a clean teardown |
+| 2.5 | Six-pack, approval gate, `blocked` and `failed` paths | Reject, approve and block cases behave per F5, F6 and F11 |
+| 2.6 | `resume` and recovery | Killing the driver at each step, then `resume`, completes with no duplicate handoffs and no lost branches |
+| 2.7 | `state.json` derivation | State is regenerated from sources only and validates against its schema |
 
-### Phase 4: Deferred (real-time, Node front end, deeper VS Code integration)
+### Phase 3: Orchestrator and surfaces
 
-Unchanged. None of it requires revisiting Phases 0–3, provided the additive-only schema rule is followed. [R19]
+| Increment | Deliverable | Exit criterion |
+|---|---|---|
+| 3.1 | `factory-orchestrator` profile (calls `resolve-pack` with the verbatim prompt) and the skill files generated from the schemas | The three example prompts in §2.1 resolve to six-pack, two-pack, two-pack |
+| 3.2 | VS Code 1.141 end to end: six-pack feature with approval stop | Success 1 met; the long-run launch method from Phase 0.3 is confirmed |
+| 3.3 | CLI end to end: two-pack bug fix | Success 2 met |
+
+### Phase 4: Post-run dashboard (v1)
+
+| Increment | Deliverable | Exit criterion |
+|---|---|---|
+| 4.1 | `factory dashboard` with `rich` and `--json` | Reconstructs any run from disk alone |
+| 4.2 | Failure report: blocking role, `failure_class`, reason, worktree paths, next command | Blocked and failed runs are actionable |
+| 4.3 | Second-repo adoption check | Success 7 met |
+
+### Phase 5: Deferred
+
+Real-time dashboard, Node front end, deeper Agents window integration, and evaluating Copilot sandboxing. None of it requires revisiting Phases 0–4 if the additive-only schema rule holds.
 
 ---
 
@@ -312,50 +361,45 @@ Unchanged. None of it requires revisiting Phases 0–3, provided the additive-on
 
 | ID | Risk | L / I | Mitigation | Verifiable in |
 |---|---|---|---|---|
-| R1 | Agents invisible because the wrong harness is selected or the files are in the wrong folder | M / H | Copilot harness + `~/.copilot/agents`; no deprecated setting [R1] | Phase 0.2 |
-| R2 | `copilot --agent` or user-agent loading fails on a CLI build | M / H | Version floor, preflight, filename = name [R2] | Phase 0.3 |
-| R3 | Worktree teardown fails on Windows when an editor holds files | M / M | Stop-don't-force; `factory clean`; dashboard shows paths | Phase 2–3 (Windows run needed) |
-| R4 | Agent acts outside its worktree (shell, `~`, interpreters) | M / M | Layered defences and driver audit; detection, not prevention [R7] | Phase 0.3 probes, Phase 2.2 |
-| R5 | Approval gate skipped | L / M | Exit 20 plus required `approvals/` record; dashboard shows it | Phase 2.3 |
-| R6 | Schema drift between agents and driver | M / M | Agents emit only the report; driver writes handoffs; schema validation | Phase 1–2 |
-| R7 | Merge conflicts at human merge due to base drift | M / M | `base_commit` recorded; result branch chained [R9] | Phase 2.1 |
-| R8 | `state.json` diverges from sources | L / L | Pure derivation, overwritten each step [R12] | Phase 2.4 |
-| R9 | Multi-repo adoption needs per-repo changes | L / M | User-level only; writable parent dir required | Phase 3.3 |
-| R10 | Future schema change breaks Node consumer | L / M | `schema_version`, additive-only, consumer ignores unknown fields; unverified until Phase 4 | Phase 2 test only; full proof in Phase 4 [R19] |
-| R11 | CLI or agent-discovery drift between versions | M / M | Version pin, preflight, drift lint [R2] | Phase 0.3, each release |
-| R12 | Headless dispatch stalls on a trust or permission prompt | M / H | Explicit flags per role; trust handling probed [R17] | Phase 0.3 |
-| R13 | A long `factory run` in VS Code's terminal tool times out or blocks on approval | M / M | Probe first. If it fails, add `--detach` with `factory status` polling | Phase 0.3 [R19] |
+| R1 | Wrong harness selected in VS Code, so agents are not used | L / M | Copilot harness documented in the skill and the run instructions; agent list verified | Phase 3.2 |
+| R2 | A CLI update changes agent discovery or flags | M / M | Version recorded and floor-checked at preflight; re-run Phase 0.3 probes on upgrade | Phase 0.3, each upgrade |
+| R3 | Worktree teardown fails on Windows when an editor holds files | M / M | Stop-don't-force; `factory clean`; dashboard shows paths | Phase 2.2, 4.2 |
+| R4 | Allow-all dispatch lets an agent act outside its worktree | M / H | Prompt boundary, deny flags if effective, post-role audit (detection only); risk accepted and documented | Phase 0.3, 2.3 |
+| R5 | Approval gate skipped | L / M | Exit 20 plus required `approvals/` record; dashboard shows it | Phase 2.5 |
+| R6 | Schema drift between agents and driver | M / M | Agents emit only the report; the driver writes handoffs; schema validation | Phase 1.1, 2.3 |
+| R7 | Merge conflicts at human merge due to base-branch drift | M / M | `base_commit` recorded; result branch chained | Phase 2.2 |
+| R8 | `state.json` diverges from sources | L / L | Pure derivation, overwritten each step | Phase 2.7 |
+| R9 | Multi-repo adoption needs per-repo changes | L / M | User-level only; writable parent directory required | Phase 4.3 |
+| R10 | A future schema change breaks the Node consumer | L / M | `schema_version`, additive-only, consumer ignores unknown fields. Fully provable only in Phase 5; Phase 1.1 tests the rule | Phase 1.1 partial, Phase 5 full |
+| R11 | A long `factory run` in the VS Code terminal tool times out or stalls on approval | M / M | Probe in Phase 0.3 using a stand-in. If it fails, add `--detach` and `factory status` polling in Phase 2 | Phase 0.3 |
+| R12 | Alias rules misfire (an alias phrase appears by accident, or a wanted phrase is not an alias) | M / M | Multi-word aliases only; applied to the prompt and `--pack`, not the request file; resolution shown and recorded; test table | Phase 2.1 |
+| R13 | Role JSON report is malformed or missing | M / M | `-s` output extraction probed; `invalid_report` and `no_report` failure classes stop the run safely | Phase 0.3, 2.3 |
 
 ---
 
 ## 9. Success Criteria
 
-1. A feature request runs through the six-pack in VS Code (Copilot harness) with only the approval stop.
-2. A bug fix runs through the two-pack in Copilot CLI.
+1. A feature request with no flow stated runs through the six-pack from the VS Code 1.141 Copilot harness, with only the approval stop.
+2. A bug fix stated as "without deep flow" or "simple task" runs through the two-pack from the CLI.
 3. Every role runs in its own chained worktree; teardown is clean for a completed run, and `resume` recovers a killed run.
 4. Every handoff is a driver-written, git-committed JSON artifact; `state.json` reconstructs the run from disk alone.
 5. The dashboard shows timeline, commits, approvals and cleanup; `--json` emits the contract.
-6. No experimental Copilot features; CLI and Git versions pinned. [R4]
+6. No experimental Copilot features; CLI, Git and VS Code versions recorded.
 7. A second repository adopts the factory with no per-repo configuration.
 
 ---
 
 ## 10. References
 
-- S1 VS Code custom agents: https://code.visualstudio.com/docs/agent-customization/custom-agents.md
-- S2 GitHub Docs, create custom agents for CLI (Spanish edition): https://docs.github.com/es/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli
-- S3 GitHub Docs, custom agents configuration: https://docs.github.com/en/copilot/reference/custom-agents-configuration
-- S4 CLI programmatic reference (Portuguese edition): https://docs.github.com/pt/copilot/reference/copilot-cli-reference/cli-programmatic-reference
-- S5 Configure Copilot CLI: https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli
-- S6 About Copilot CLI (security): https://docs.github.com/enterprise-cloud@latest/copilot/concepts/agents/about-copilot-cli
-- S7 copilot-cli #452: https://github.com/github/copilot-cli/issues/452
-- S8 copilot-cli #2475: https://github.com/github/copilot-cli/issues/2475
-- S9 copilot-cli #2309 (bug report): https://github.com/github/copilot-cli/issues/2309
-- S10 copilot-cli #3297: https://github.com/github/copilot-cli/issues/3297
-- S11 About Agent Skills: https://docs.github.com/en/enterprise-cloud@latest/copilot/concepts/agents/about-agent-skills
-- S12 Third-party note on VS Code skills paths (weak source): https://docs.tabulareditor.com/en/features/te-cli/te-cli-skill.html
-- S13 git-worktree: https://www.kernel.org/pub/software/scm/git/docs/git-worktree.html
-- Design inspirations: Sandcastle (Matt Pocock), SwarmForge (Uncle Bob), unchanged.
+- VS Code custom agents: https://code.visualstudio.com/docs/agent-customization/custom-agents.md
+- VS Code tools with agents (Copilot harness): https://code.visualstudio.com/docs/agents/run/tools.md
+- GitHub Docs, custom agents configuration: https://docs.github.com/en/copilot/reference/custom-agents-configuration
+- GitHub Docs, CLI programmatic reference: https://docs.github.com/pt/copilot/reference/copilot-cli-reference/cli-programmatic-reference
+- GitHub Docs, configure Copilot CLI: https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli
+- git-worktree: https://www.kernel.org/pub/software/scm/git/docs/git-worktree.html
+- VS Code 1.141 coverage: https://visualstudiomagazine.com/articles/2026/10/13/vs-code-1-141-brings-copilot-codex-sessions-together-tightens-ai-agent-security.aspx
+- copilot-cli issues #452, #2475, #2309, #3297 (agent discovery and path-scope bug reports): https://github.com/github/copilot-cli/issues
+- Design inspirations: Sandcastle (Matt Pocock), SwarmForge (Uncle Bob).
 
 ---
 
@@ -364,5 +408,20 @@ Unchanged. None of it requires revisiting Phases 0–3, provided the additive-on
 | Version | Date | Change |
 |---|---|---|
 | 1.0 | 2026-10-20 | Frozen baseline |
-| 1.1 | 2026-10-20 | Corrected VS Code/CLI discovery and harness model [R1–R4]; driver-only dispatch and explicit approval command [R5]; driver-written, git-backed handoffs with commit/audit rules [R6–R8]; chained worktrees, run-root layout, collision-safe run-id [R9–R10]; schema, state sources, duplicate and failure contracts [R11–R14]; recovery and cleanup [R15–R16]; dispatch template [R17]; pack-selection edge cases [R18]; risk table re-verified [R19]; guidelines rewritten honestly [R20]; Phase 0.3 probes [R21] |
+| 1.1 | 2026-10-20 | Review refinements: driver-only dispatch, driver-written git-backed handoffs, chained worktrees, run-root layout, failure and recovery contracts, rewritten guidelines |
+| 1.2 | 2026-10-20 | Greenfield build order (driver built in Phase 2 with a stand-in `copilot` for tests; orchestrator moved to Phase 3; dashboard to Phase 4); verified items moved to baseline (E1–E5); VS Code 1.141 Copilot harness as target; allow-flag dispatch and audit-based confinement stated as accepted risk; pack aliases with default six-pack and deterministic longest-match resolution; probes reduced to the remaining unknowns |
 
+---
+
+# Open verifications
+
+These are the only unverified claims. All run in Phase 0.3 as hand-run probes with no factory tool, except where noted.
+
+1. **Deny flags with allow flags:** whether `--deny-tool` patterns (for example `git worktree`, `git push`, branch deletion) still block when allow flags are set. This decides whether confinement has any prevention layer or is audit-only.
+2. **Minimal allow set:** whether `--allow-all-tools --allow-all-paths` (without `--allow-all-urls`) runs headless without prompts, or `--allow-all` is required.
+3. **Report extraction:** whether `-s` output reliably gives the role's final JSON message, and what exit code and output the CLI produces on crash, tool failure and timeout. This defines `crashed` versus `no_report`.
+4. **Linked-worktree ref mutation:** whether an agent in a linked worktree can alter other branches or the main repo's refs (expected from Git's design, not verified here). This drives the audit's ref snapshot.
+5. **Long-run launch from VS Code:** whether the orchestrator can run a command lasting longer than a full six-pack run via the terminal tool without timeout or approval stalls. Probe with a stand-in `sleep` script. If it fails, add `--detach` and `factory status`.
+6. **Per-role timeout default:** 30 minutes is a placeholder, calibrated from measured runs in Phase 2.4 and 2.5.
+7. **Windows teardown behaviour:** verifiable only in a Windows run (Phase 2.2 and 4.2).
+8. **Copilot sandboxing in 1.141:** whether the new sandbox applies to the Copilot CLI processes the driver spawns, and whether it could replace audit-only confinement. This is research for Phase 5, not a v1 dependency.
